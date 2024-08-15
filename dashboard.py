@@ -270,6 +270,34 @@ def calculate_traffic_statistics(traffic):
         "Congestion Range": f"{least_congested:.2f} - {most_congested:.2f}"
         }
     
+def calculate_supply_chain_costs(distances, traffic, risk, emissions, operating_costs, demands, inventories):
+  
+    transportation_costs = np.sum(distances * traffic * demands)
+    
+    risk_costs = np.sum(risk * demands)
+    
+ 
+    emission_costs = np.sum(emissions * demands)
+    
+   
+    total_operating_costs = np.sum(operating_costs)
+    
+   
+    holding_cost_rate = 0.2
+    average_product_value = 50  # Assuming an average product value of $50
+    holding_costs = np.sum(inventories) * average_product_value * holding_cost_rate
+    
+    
+    total_cost = transportation_costs + risk_costs + emission_costs + total_operating_costs + holding_costs
+    
+    return {
+        "Transportation Costs": transportation_costs,
+        "Risk-related Costs": risk_costs,
+        "Emission Costs": emission_costs,
+        "Operating Costs": total_operating_costs,
+        "Holding Costs": holding_costs,
+        "Total Supply Chain Cost": total_cost
+    }
 
 def plot_traffic_graph():
     G = nx.Graph()
@@ -510,6 +538,8 @@ def main():
         with st.expander("##### Store Clustering", expanded=True):
             st.pyplot(plot_store_clustering())
 
+      
+
         with st.expander("##### Cost Breakdown", expanded=True):
             cost_components = {
                 'Distance': np.sum(distances),
@@ -519,6 +549,52 @@ def main():
                 'Operating Costs': np.sum(operating_costs)
             }
             st.pyplot(plot_cost_breakdown(cost_components))
+
+    
+
+        with st.expander("##### Cost Breakdown", expanded=True):
+            cost_components = {
+                'Distance': np.sum(distances),
+                'Traffic': np.sum(traffic),
+                'Risk': np.sum(risk),
+                'Emissions': np.sum(emissions),
+                'Operating Costs': np.sum(operating_costs)
+            }
+            st.pyplot(plot_cost_breakdown(cost_components))
+
+        with st.expander("##### Supply Chain Costs", expanded=True):
+            supply_chain_costs = calculate_supply_chain_costs(distances, traffic, risk, emissions, operating_costs, demands, inventories)
+            
+            st.write("##### Calculated Supply Chain Costs:")
+            total_cost = supply_chain_costs["Total Supply Chain Cost"]
+            for cost_type, cost_value in supply_chain_costs.items():
+                    if cost_type != "Total Supply Chain Cost":
+                        percentage = (cost_value / total_cost) * 100
+                        st.write(f"- **{cost_type}:** ${cost_value:,.2f} ({percentage:.2f}%)")
+
+
+     
+            fig, ax = plt.subplots(figsize=(10, 8))
+            cost_types = list(supply_chain_costs.keys())[:-1]  # Exclude total cost
+            cost_values = [supply_chain_costs[cost_type] for cost_type in cost_types]
+            
+            wedges, texts = ax.pie(cost_values, startangle=90)
+       
+            centre_circle = plt.Circle((0, 0), 0.70, fc='white')
+            fig.gca().add_artist(centre_circle)
+            
+            ax.axis('equal') 
+            ax.set_title("Supply Chain Cost Breakdown")
+        
+            ax.legend(wedges, cost_types,
+                      title="Cost Components",
+                      loc="center left",
+                      bbox_to_anchor=(1, 0, 0.5, 1))
+            
+            plt.tight_layout()
+            st.pyplot(fig)
+
+
 
     with tab2:
         with st.expander("##### Traffic Graph", expanded=True):
