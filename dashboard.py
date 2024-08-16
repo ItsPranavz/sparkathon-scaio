@@ -694,7 +694,7 @@ def main():
                 # Load dataset
                 @st.cache_data
                 def load_data():
-                    return pd.read_csv("indian_industrial_areas_dataset_combined.csv")
+                    return pd.read_csv("dataset.csv")
 
                 df = load_data()
 
@@ -792,7 +792,7 @@ def main():
                     # Load dataset
                     @st.cache_data
                     def load_data():
-                        return pd.read_csv("indian_industrial_areas_dataset_combined.csv")
+                        return pd.read_csv("dataset.csv")
 
                     df = load_data()
 
