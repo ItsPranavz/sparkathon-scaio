@@ -682,7 +682,7 @@ def main():
                 for stat, value in risk_stats.items():
                     st.write(f"- **{stat}:** {value}")
 
-            with st.expander("### Vulnerability Assessment"):
+            with st.expander("### Vulnerability Assessment", expanded=True):
                 st.markdown("*Shows the high risk DCs and alternatives for relocation*")
                 st.write("##### High Risk DCs")
                 st.table(df_top_3)
