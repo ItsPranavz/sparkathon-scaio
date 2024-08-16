@@ -4,25 +4,54 @@ import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
 import networkx as nx
 from mpl_toolkits.basemap import Basemap
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from sklearn.metrics import mean_squared_error
+from math import sqrt
+from scipy.spatial.distance import cdist
 from concurrent.futures import ThreadPoolExecutor
+import pandas as pd
 import time
 
+def generate_seasonal_data(n_periods, n_dcs, trend_range=(50, 150), seasonal_amplitude=10, noise_scale=5):
+
+    data = {}
+
+    for dc_id in range(1, n_dcs + 1):
+        dc_name = f"DC{dc_id}"
+        
+        # Generate a linear trend component
+        trend = np.linspace(trend_range[0], trend_range[1], n_periods)
+        
+        # Generate a seasonal component (e.g., sine wave for periodicity)
+        seasonal = seasonal_amplitude * np.sin(2 * np.pi * np.arange(n_periods) / (n_periods / 12))
+        
+        # Generate random noise
+        noise = np.random.normal(scale=noise_scale, size=n_periods)
+        
+        # Combine trend, seasonal, and noise
+        demand = trend + seasonal + noise
+        
+        # Add to the dictionary
+        data[dc_name] = demand.tolist()
+    
+    return data
+
 # Set random seed for reproducibility
-np.random.seed(42)
+np.random.seed(12)
 
 # Generate sample data
-n_stores = 20
-n_dcs = 10
+n_stores = 10
+n_dcs = 5
 dcs = [f"DC{i}" for i in range(1, n_dcs+1)]
 stores = [f"Store{i}" for i in range(1, n_stores+1)]
 demands = np.random.randint(50, 200, n_stores)
 inventories = np.random.randint(100, 500, n_dcs)
 
 # Assign random coordinates and other data
-store_latitudes = np.random.uniform(30, 50, n_stores)
-store_longitudes = np.random.uniform(-120, -70, n_stores)
-dc_latitudes = np.random.uniform(30, 50, n_dcs)
-dc_longitudes = np.random.uniform(-120, -70, n_dcs)
+store_latitudes = np.random.uniform(15.0, 29.0, n_stores)
+store_longitudes = np.random.uniform(73.0, 86.0, n_stores)
+dc_latitudes = np.random.uniform(15.0, 29.0, n_dcs)
+dc_longitudes = np.random.uniform(73.0, 86.0, n_dcs)
 
 # Create distance matrix
 locations = np.column_stack((store_latitudes, store_longitudes))
@@ -31,6 +60,89 @@ traffic = np.random.uniform(1, 2, (n_dcs, n_stores))
 risk = np.random.uniform(1, 1.5, (n_dcs, n_stores))
 emissions = np.random.uniform(1, 1.2, (n_dcs, n_stores))
 operating_costs = np.random.uniform(50, 200, n_dcs)
+
+def top_3_dcs_with_highest_risks(risk, dc_latitudes, dc_longitudes):
+    # Calculate the sum of risks for each DC
+    total_risks = np.sum(risk, axis=1)
+    
+    # Get the indices of the DCs sorted by total risk in descending order
+    sorted_indices = np.argsort(total_risks)[::-1]
+    
+    # Get the top 3 DCs
+    top_3_indices = sorted_indices[:3]
+    
+    # Create a DataFrame with details of the top 3 DCs
+    dc_names = [f"DC{i}" for i in top_3_indices]  # Example names for DCs
+    top_3_details = {
+        "DC Name": dc_names,
+        "Latitude": dc_latitudes[top_3_indices],
+        "Longitude": dc_longitudes[top_3_indices],
+        "Total Risk": total_risks[top_3_indices]
+    }
+    
+    df_top_3 = pd.DataFrame(top_3_details)
+    
+    return df_top_3
+
+# Function to find nearest industrial area
+def find_nearest_industrial_area(centroid, df):
+    distances = cdist([centroid], df[['Latitude', 'Longitude']])
+    nearest_index = distances.argmin()
+    return df.iloc[nearest_index]
+
+# Function to find optimal locations
+def find_optimal_locations(G, num_optimal=3):
+    cost_matrix = []
+    for node in G.nodes():
+        total_cost = (G.nodes[node]['land_cost'] + 
+                      G.nodes[node]['labor_cost'] * 30 +
+                      G.nodes[node]['electricity_cost'] * 1000 +
+                      G.nodes[node]['risk_factor'] * 1000)
+        cost_matrix.append((node, total_cost))
+    return sorted(cost_matrix, key=lambda x: x[1])[:num_optimal]
+
+# Function to forecast demand for a single store using SARIMAX
+def forecast_store_demand(demand_history, forecast_days=10):
+    # Convert to DataFrame
+    df = pd.DataFrame({'demand': demand_history})
+    df.index = pd.date_range(end='2023-08-16', periods=len(demand_history), freq='D')
+    
+    # Split the data
+    train = df[:-forecast_days]
+    test = df[-forecast_days:]
+    
+    # Fit SARIMAX model
+    model = SARIMAX(train['demand'], order=(1,1,1), seasonal_order=(1,1,1,12))
+    results = model.fit()
+    
+    # Forecast
+    forecast = results.get_forecast(steps=forecast_days)
+    forecast_mean = forecast.predicted_mean
+    
+    # Calculate RMSE
+    rmse = sqrt(mean_squared_error(test['demand'], forecast_mean))
+    
+    return forecast_mean.tolist(), rmse
+
+# Function to forecast demands for all stores in parallel
+def forecast_all_stores(input_data, forecast_days=10):
+    forecasts = {}
+    avg_forecasts = {}
+    rmse_values = {}
+    
+    def process_store(store, demand_history):
+        forecast, rmse = forecast_store_demand(demand_history, forecast_days)
+        return store, forecast, np.mean(forecast), rmse
+    
+    with ThreadPoolExecutor() as executor:
+        results = list(executor.map(lambda item: process_store(item[0], item[1]), input_data.items()))
+    
+    for store, forecast, avg_forecast, rmse in results:
+        forecasts[store] = forecast
+        avg_forecasts[store] = avg_forecast
+        rmse_values[store] = rmse
+    
+    return forecasts, avg_forecasts, rmse_values
 
 class SupplyChainACO:
     def __init__(self, n_ants, n_iterations, alpha, beta, rho, q0):
@@ -71,9 +183,6 @@ class SupplyChainACO:
     def construct_solutions(self):
         with ThreadPoolExecutor() as executor:
             return list(executor.map(self.ant_tour, range(self.n_ants)))
-        
-  
-        
 
     def ant_tour(self, _):
         remaining_demands = self.demands.copy()
@@ -155,24 +264,55 @@ class SupplyChainACO:
         for path in paths:
             st.write(f"- {path}")
 
+    def plot_capacity_utilization(self):
+        utilizations = [1 - (inv - np.sum(solution[dc, :]) / inv) for dc, inv in enumerate(inventories)]
+        fig, ax = plt.subplots(figsize=(12, 8))
+        ax.bar(range(n_dcs), utilizations, color='orange')
+        ax.set_title("Capacity Utilization of Distribution Centers")
+        ax.set_xlabel("Distribution Center")
+        ax.set_ylabel("Utilization")
+        return fig
+
+def calculate_supply_chain_costs(distances, traffic, risk, emissions, operating_costs, demands, inventories):
+  
+    transportation_costs = np.sum(distances * traffic * demands) * 0.0357
+    
+    risk_costs = np.sum(risk * demands) * 0.44
+ 
+    emission_costs = np.sum(emissions * demands) * 0.36
+   
+    total_operating_costs = np.sum(operating_costs) * 12.61
+   
+    holding_cost_rate = 0.2
+    average_product_value = 50  # Assuming an average product value of $50
+    holding_costs = np.sum(inventories) * average_product_value * holding_cost_rate * 0.42
+    
+    total_cost = transportation_costs + risk_costs + emission_costs + total_operating_costs + holding_costs
+    
+    return {
+        "Transportation Costs": transportation_costs,
+        "Risk-related Costs": risk_costs,
+        "Emission Costs": emission_costs,
+        "Operating Costs": total_operating_costs,
+        "Holding Costs": holding_costs,
+        "Total Supply Chain Cost": total_cost
+    }
+
 def plot_demand_distribution():
     fig, ax = plt.subplots(figsize=(12, 8))
     
     # Create a Basemap instance with zoomed-in parameters
-    m = Basemap(projection='merc', llcrnrlat=20, urcrnrlat=60,
-                llcrnrlon=-150, urcrnrlon=-60, resolution='l', ax=ax)
-    
-    # Draw map boundaries and fill the continents
-    m.drawmapboundary(fill_color='lightblue')
-    m.fillcontinents(color='lightgray', lake_color='lightblue')
-    m.drawcoastlines()
-    m.drawcountries()
+    m = Basemap(projection='merc', llcrnrlat=8, urcrnrlat=35, llcrnrlon=68, urcrnrlon=97, resolution='i', ax=ax)
+    m.drawcountries(linewidth=1.0, color='black')
+    m.fillcontinents(color='lightgreen', lake_color='aqua')
+    m.drawmapboundary(fill_color='aqua')
+    m.drawstates(linewidth=0.5, color='gray')
     
     # Convert lat/lon to map projection coordinates
     x_stores, y_stores = m(store_longitudes, store_latitudes)
     
     # Scatter plot of stores with demand color coding
-    scatter = m.scatter(x_stores, y_stores, c=demands, cmap='viridis', s=50, edgecolor='k', label='Stores')
+    scatter = m.scatter(x_stores, y_stores, c=demands, cmap='YlOrRd', s=50, edgecolor='k', label='Stores')
     
     # Add labels for each store
     for i, txt in enumerate(stores):
@@ -187,20 +327,17 @@ def plot_inventory_distribution():
     fig, ax = plt.subplots(figsize=(12, 8))
     
     # Create a Basemap instance with zoomed-in parameters
-    m = Basemap(projection='merc', llcrnrlat=20, urcrnrlat=60,
-                llcrnrlon=-150, urcrnrlon=-60, resolution='l', ax=ax)
-    
-    # Draw map boundaries and fill the continents
-    m.drawmapboundary(fill_color='lightblue')
-    m.fillcontinents(color='lightgray', lake_color='lightblue')
-    m.drawcoastlines()
-    m.drawcountries()
+    m = Basemap(projection='merc', llcrnrlat=8, urcrnrlat=35, llcrnrlon=68, urcrnrlon=97, resolution='i', ax=ax)
+    m.drawcountries(linewidth=1.0, color='black')
+    m.fillcontinents(color='lightgreen', lake_color='aqua')
+    m.drawmapboundary(fill_color='aqua')
+    m.drawstates(linewidth=0.5, color='gray')
     
     # Convert lat/lon to map projection coordinates
     x_dcs, y_dcs = m(dc_longitudes, dc_latitudes)
     
     # Scatter plot of distribution centers with inventory color coding
-    scatter = m.scatter(x_dcs, y_dcs, c=inventories, cmap='plasma', s=100, edgecolor='k', label='Distribution Centers')
+    scatter = m.scatter(x_dcs, y_dcs, c=inventories, cmap='YlOrRd', s=100, edgecolor='k', label='Distribution Centers')
     
     # Add labels for each distribution center
     for i, txt in enumerate(dcs):
@@ -210,6 +347,25 @@ def plot_inventory_distribution():
     plt.colorbar(scatter, label="Inventory")
     
     return fig
+
+def plot_risk_graph():
+    G = nx.Graph()
+    for i in range(n_dcs):
+        for j in range(n_stores):
+            G.add_edge(f"DC{i}", f"Store{j}", weight=risk[i][j])
+
+    pos = nx.spring_layout(G)
+    fig, ax = plt.subplots(figsize=(10, 8))
+    edges = nx.draw_networkx_edges(G, pos, edge_color=[G[u][v]['weight'] for u, v in G.edges()],
+                                   edge_cmap=plt.cm.YlOrRd, width=2, ax=ax)
+    nx.draw_networkx_nodes(G, pos, node_color='lightblue', node_size=500, ax=ax)
+    nx.draw_networkx_labels(G, pos, ax=ax)
+    plt.colorbar(edges, label='Risk')
+    ax.set_title("Risk Graph")
+    ax.axis('off')
+    
+    stats = calculate_risk_statistics(risk)
+    return fig, stats
 
 def calculate_risk_statistics(risk):
     flat_risk = risk.flatten()
@@ -231,25 +387,6 @@ def calculate_risk_statistics(risk):
         "Risk Range": f"{lowest_risk:.2f} - {highest_risk:.2f}"
     }
 
-def plot_risk_graph():
-    G = nx.Graph()
-    for i in range(n_dcs):
-        for j in range(n_stores):
-            G.add_edge(f"DC{i}", f"Store{j}", weight=risk[i][j])
-
-    pos = nx.spring_layout(G)
-    fig, ax = plt.subplots(figsize=(10, 8))
-    edges = nx.draw_networkx_edges(G, pos, edge_color=[G[u][v]['weight'] for u, v in G.edges()],
-                                   edge_cmap=plt.cm.YlOrRd, width=2, ax=ax)
-    nx.draw_networkx_nodes(G, pos, node_color='lightblue', node_size=500, ax=ax)
-    nx.draw_networkx_labels(G, pos, ax=ax)
-    plt.colorbar(edges, label='Risk')
-    ax.set_title("Risk Graph")
-    ax.axis('off')
-    
-    stats = calculate_risk_statistics(risk)
-    return fig, stats
-
 def calculate_traffic_statistics(traffic):
         flat_traffic = traffic.flatten()
         most_congested = np.max(flat_traffic)
@@ -269,35 +406,6 @@ def calculate_traffic_statistics(traffic):
         "Standard Deviation of Congestion": f"{std_dev_congestion:.2f}",
         "Congestion Range": f"{least_congested:.2f} - {most_congested:.2f}"
         }
-    
-def calculate_supply_chain_costs(distances, traffic, risk, emissions, operating_costs, demands, inventories):
-  
-    transportation_costs = np.sum(distances * traffic * demands)
-    
-    risk_costs = np.sum(risk * demands)
-    
- 
-    emission_costs = np.sum(emissions * demands)
-    
-   
-    total_operating_costs = np.sum(operating_costs)
-    
-   
-    holding_cost_rate = 0.2
-    average_product_value = 50  # Assuming an average product value of $50
-    holding_costs = np.sum(inventories) * average_product_value * holding_cost_rate
-    
-    
-    total_cost = transportation_costs + risk_costs + emission_costs + total_operating_costs + holding_costs
-    
-    return {
-        "Transportation Costs": transportation_costs,
-        "Risk-related Costs": risk_costs,
-        "Emission Costs": emission_costs,
-        "Operating Costs": total_operating_costs,
-        "Holding Costs": holding_costs,
-        "Total Supply Chain Cost": total_cost
-    }
 
 def plot_traffic_graph():
     G = nx.Graph()
@@ -324,14 +432,11 @@ def plot_initial_setup():
     fig, ax = plt.subplots(figsize=(12, 8))
     
     # Create a Basemap instance with zoomed-in parameters
-    m = Basemap(projection='merc', llcrnrlat=20, urcrnrlat=60,
-                llcrnrlon=-150, urcrnrlon=-60, resolution='l', ax=ax)
-    
-    # Draw map boundaries and fill the continents
-    m.drawmapboundary(fill_color='lightblue')
-    m.fillcontinents(color='lightgray', lake_color='lightblue')
-    m.drawcoastlines()
-    m.drawcountries()
+    m = Basemap(projection='merc', llcrnrlat=8, urcrnrlat=35, llcrnrlon=68, urcrnrlon=97, resolution='i', ax=ax)
+    m.drawcountries(linewidth=1.0, color='black')
+    m.fillcontinents(color='lightgreen', lake_color='aqua')
+    m.drawmapboundary(fill_color='aqua')
+    m.drawstates(linewidth=0.5, color='gray')
     
     # Convert lat/lon to map projection coordinates
     x_stores, y_stores = m(store_longitudes, store_latitudes)
@@ -394,13 +499,11 @@ def calculate_recommended_locations():
 
     # Plot 2: World Map
     fig_map, ax_map = plt.subplots(figsize=(12, 8))
-    m = Basemap(projection='merc', llcrnrlat=20, urcrnrlat=60,
-                llcrnrlon=-150, urcrnrlon=-60, resolution='l', ax=ax_map)
-    
-    m.drawmapboundary(fill_color='lightblue')
-    m.fillcontinents(color='lightgray', lake_color='lightblue')
-    m.drawcoastlines()
-    m.drawcountries()
+    m = Basemap(projection='merc', llcrnrlat=8, urcrnrlat=35, llcrnrlon=68, urcrnrlon=97, resolution='i', ax=ax)
+    m.drawcountries(linewidth=1.0, color='black')
+    m.fillcontinents(color='lightgreen', lake_color='aqua')
+    m.drawmapboundary(fill_color='aqua')
+    m.drawstates(linewidth=0.5, color='gray')
     
     x_stores, y_stores = m(store_longitudes, store_latitudes)
     x_centroids, y_centroids = m(weighted_centroids[:, 1], weighted_centroids[:, 0])
@@ -418,7 +521,7 @@ def calculate_recommended_locations():
         for point in cluster_points:
             ax_map.plot([centroid[1], point[1]], [centroid[0], point[0]], 'k-', alpha=0.1)
 
-    return fig, fig_map, weighted_centroids
+    return fig, fig_map, weighted_centroids, kmeans.labels_, optimal_k
 
 def plot_cost_breakdown(cost_components):
     fig, ax = plt.subplots(figsize=(10, 8))  # Increase figure size for better readability
@@ -451,19 +554,6 @@ def plot_cost_breakdown(cost_components):
     
     return fig
 
-def plot_demand_fulfillment(solution):
-    fig, ax = plt.subplots()
-    for dc in range(n_dcs):
-        for store in range(n_stores):
-            if solution[dc][store] > 0:
-                ax.plot([store_longitudes[dc], store_longitudes[store]],
-                        [store_latitudes[dc], store_latitudes[store]],
-                        'r-', alpha=0.5)
-    ax.set_title("Demand Fulfillment Map")
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
-    return fig
-
 def plot_store_clustering():
     # Determine optimal number of clusters using the Elbow Method
     distortions = []
@@ -493,146 +583,372 @@ def plot_store_clustering():
     
     return fig
 
-def plot_operational_cost_trends(costs):
-    fig, ax = plt.subplots()
-    ax.plot(costs, marker='o', linestyle='-')
-    ax.set_title("Operational Cost Trends")
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Cost")
-    return fig
-
-def plot_capacity_utilization():
-    utilizations = [1 - (inv - np.sum(solution[dc, :]) / inv) for dc, inv in enumerate(inventories)]
-    fig, ax = plt.subplots()
-    ax.bar(range(n_dcs), utilizations, color='orange')
-    ax.set_title("Capacity Utilization of Distribution Centers")
-    ax.set_xlabel("Distribution Center")
-    ax.set_ylabel("Utilization")
-    return fig
-
 def main():
-    st.title("SCAIO Dashboard")
-    
+    st.title("SCAIO Dashboard: AI-Powered Supply Chain Optimization")
+    st.markdown("*Visualize, analyze, and optimize your supply chain network with advanced AI techniques.*")
+
     # Parameters
-    st.sidebar.write("### Configure Hyperparameters")
-    n_ants = st.sidebar.slider("Number of Ants", 10, 100, 50)
-    n_iterations = st.sidebar.slider("Number of Iterations", 10, 200, 100)
-    alpha = st.sidebar.slider("Alpha (pheromone importance)", 0.1, 5.0, 1.0)
-    beta = st.sidebar.slider("Beta (heuristic importance)", 0.1, 5.0, 2.0)
-    rho = st.sidebar.slider("Pheromone Evaporation Rate", 0.01, 1.0, 0.1)
-    q0 = st.sidebar.slider("q0 (exploitation vs exploration)", 0.0, 1.0, 0.9)
+    st.sidebar.write("### Configure Optimization")
+    st.sidebar.markdown("*Adjust these parameters to fine-tune the optimization algorithm.*")
+    n_ants = st.sidebar.slider("Number of Ants", 10, 100, 50, help="More ants can improve solution quality but increase computation time.")
+    n_iterations = st.sidebar.slider("Number of Iterations", 10, 200, 100, help="More iterations may lead to better solutions but take longer to compute.")
+    alpha = st.sidebar.slider("Alpha (pheromone importance)", 0.1, 5.0, 1.0, help="Higher values give more importance to pheromone trails.")
+    beta = st.sidebar.slider("Beta (heuristic importance)", 0.1, 5.0, 2.0, help="Higher values give more importance to heuristic information.")
+    rho = st.sidebar.slider("Pheromone Evaporation Rate", 0.01, 1.0, 0.1, help="Controls how quickly pheromone trails decay.")
+    q0 = st.sidebar.slider("q0 (exploitation vs exploration)", 0.0, 1.0, 0.9, help="Higher values favor exploitation of known good paths.")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Network Setup", "Traffic Analysis", "Risk Analysis", "Optimize"])
+    st.sidebar.write("### Configure Forecasting")
+    st.sidebar.markdown("*Adjust these parameters to fine-tune the forecasting algorithm.*")
+    n_periods = st.sidebar.slider("Number of periods", 10, 100, 50, help="Number of periods to consider for training forecasting model.")
+    n_forecast_days = st.sidebar.slider("Forecasting length", 5, 30
+    , 10, help="Number of days to forecast from current date.")
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Network Setup", "Traffic Analysis", "Risk Analysis", "Optimize", "Forecast"])
     
-    # Visualization
     with tab1:
-        with st.expander("##### Supply Chain Setup", expanded=True):
-            st.pyplot(plot_initial_setup()) 
-        
-        with st.expander("##### Demand Distribution", expanded=True):
-            st.pyplot(plot_demand_distribution())
-        
-        with st.expander("##### Inventory Distribution", expanded=True):
-            st.pyplot(plot_inventory_distribution())
-        
-        with st.expander("##### Store Clustering", expanded=True):
-            st.pyplot(plot_store_clustering())
-
-      
-
-        with st.expander("##### Cost Breakdown", expanded=True):
-            cost_components = {
-                'Distance': np.sum(distances),
-                'Traffic': np.sum(traffic),
-                'Risk': np.sum(risk),
-                'Emissions': np.sum(emissions),
-                'Operating Costs': np.sum(operating_costs)
-            }
-            st.pyplot(plot_cost_breakdown(cost_components))
-
-    
-
-        with st.expander("##### Cost Breakdown", expanded=True):
-            cost_components = {
-                'Distance': np.sum(distances),
-                'Traffic': np.sum(traffic),
-                'Risk': np.sum(risk),
-                'Emissions': np.sum(emissions),
-                'Operating Costs': np.sum(operating_costs)
-            }
-            st.pyplot(plot_cost_breakdown(cost_components))
-
-        with st.expander("##### Supply Chain Costs", expanded=True):
-            supply_chain_costs = calculate_supply_chain_costs(distances, traffic, risk, emissions, operating_costs, demands, inventories)
+        with st.spinner("Loading visualizations... please wait!"):
+            st.markdown("### Network Setup: Visualize Your Supply Chain")
             
-            st.write("##### Calculated Supply Chain Costs:")
-            total_cost = supply_chain_costs["Total Supply Chain Cost"]
-            for cost_type, cost_value in supply_chain_costs.items():
-                    if cost_type != "Total Supply Chain Cost":
-                        percentage = (cost_value / total_cost) * 100
-                        st.write(f"- **{cost_type}:** ${cost_value:,.2f} ({percentage:.2f}%)")
+            with st.expander("Supply Chain Setup", expanded=True):
+                st.markdown("*Overview of distribution centers and stores on a map.*")
+                st.pyplot(plot_initial_setup()) 
+            
+            with st.expander("Demand Distribution", expanded=True):
+                st.markdown("*Visualizes store locations with demand represented by color intensity.*")
+                st.pyplot(plot_demand_distribution())
+            
+            with st.expander("Inventory Distribution", expanded=True):
+                st.markdown("*Shows distribution center locations with inventory levels indicated by color.*")
+                st.pyplot(plot_inventory_distribution())
+            
+            with st.expander("Store Clustering", expanded=True):
+                st.markdown("*Groups stores based on location and demand using K-means clustering.*")
+                st.pyplot(plot_store_clustering())
+
+            with st.expander("Cost Breakdown", expanded=True):
+                supply_chain_costs = calculate_supply_chain_costs(distances, traffic, risk, emissions, operating_costs, demands, inventories)
+                
+                st.write("##### Estimated Supply Chain Costs:")
+                total_cost = supply_chain_costs["Total Supply Chain Cost"]
+                for cost_type, cost_value in supply_chain_costs.items():
+                        if cost_type != "Total Supply Chain Cost":
+                            percentage = (cost_value / total_cost) * 100
+                            st.write(f"- **{cost_type}:** ${cost_value:,.2f} ({percentage:.2f}%)")
 
 
-     
-            fig, ax = plt.subplots(figsize=(10, 8))
-            cost_types = list(supply_chain_costs.keys())[:-1]  # Exclude total cost
-            cost_values = [supply_chain_costs[cost_type] for cost_type in cost_types]
-            
-            wedges, texts = ax.pie(cost_values, startangle=90)
-       
-            centre_circle = plt.Circle((0, 0), 0.70, fc='white')
-            fig.gca().add_artist(centre_circle)
-            
-            ax.axis('equal') 
-            ax.set_title("Supply Chain Cost Breakdown")
         
-            ax.legend(wedges, cost_types,
-                      title="Cost Components",
-                      loc="center left",
-                      bbox_to_anchor=(1, 0, 0.5, 1))
+                fig, ax = plt.subplots(figsize=(10, 8))
+                cost_types = list(supply_chain_costs.keys())[:-1]  # Exclude total cost
+                cost_values = [supply_chain_costs[cost_type] for cost_type in cost_types]
+                
+                wedges, texts = ax.pie(cost_values, startangle=90)
+        
+                centre_circle = plt.Circle((0, 0), 0.70, fc='white')
+                fig.gca().add_artist(centre_circle)
+                
+                ax.axis('equal') 
+                ax.set_title("Supply Chain Cost Breakdown")
             
-            plt.tight_layout()
-            st.pyplot(fig)
-
-
+                ax.legend(wedges, cost_types,
+                        title="Cost Components",
+                        loc="center left",
+                        bbox_to_anchor=(1, 0, 0.5, 1))
+                
+                plt.tight_layout()
+                st.pyplot(fig)
 
     with tab2:
-        with st.expander("##### Traffic Graph", expanded=True):
-            fig, traffic_stats = plot_traffic_graph()
-            st.pyplot(fig)
-            
-            st.write("##### Traffic Statistics:")
-            for stat, value in traffic_stats.items():
-                st.write(f"- **{stat}:** {value}")
+        with st.spinner("Analyzing traffic... please wait!"):
+            st.markdown("### Traffic Analysis: Understand Network Congestion")
+            with st.expander("Traffic Graph", expanded=True):
+                st.markdown("*Visualizes traffic conditions between distribution centers and stores.*")
+                fig, traffic_stats = plot_traffic_graph()
+                st.pyplot(fig)
+                
+                st.write("##### Traffic Statistics:")
+                for stat, value in traffic_stats.items():
+                    st.write(f"- **{stat}:** {value}")
 
     with tab3:
-        with st.expander("##### Risk Graph", expanded=True):
-            fig, risk_stats = plot_risk_graph()
-            st.pyplot(fig)
-            
-            st.write("##### Risk Statistics:")
-            for stat, value in risk_stats.items():
-                st.write(f"- **{stat}:** {value}")
+        with st.spinner("Analyzing risk... please wait!"):
+            df_top_3 = top_3_dcs_with_highest_risks(risk, dc_latitudes, dc_longitudes)
+            st.markdown("### Risk Analysis: Identify Vulnerable Links")
+            with st.expander("Risk Graph", expanded=True):
+                st.markdown("*Highlights high-risk connections in the supply chain network.*")
+                fig, risk_stats = plot_risk_graph()
+                st.pyplot(fig)
+                
+                st.write("##### Risk Statistics:")
+                for stat, value in risk_stats.items():
+                    st.write(f"- **{stat}:** {value}")
+
+            with st.expander("### Vulnerability Assessment"):
+                st.markdown("*Shows the high risk DCs and alternatives for relocation*")
+                st.write("##### High Risk DCs")
+                st.table(df_top_3)
+
+                coordinates_array = df_top_3[['Latitude', 'Longitude']].values.tolist()
+
+                st.markdown("*Suggests optimal locations for new distribution centers based on demand patterns.*")
+
+                # Load dataset
+                @st.cache_data
+                def load_data():
+                    return pd.read_csv("indian_industrial_areas_dataset_combined.csv")
+
+                df = load_data()
+
+                # Find nearest industrial areas to centroids
+                nearest_areas = [find_nearest_industrial_area(coord, df) for coord in coordinates_array]
+                cumulative_demands = [100 for _ in range(len(nearest_areas))]
+
+                # Create a supply chain network
+                G = nx.Graph()
+
+                # Add nodes (nearest industrial areas) to the graph
+                for i, area in enumerate(nearest_areas):
+                    demand = cumulative_demands[i]
+                    land_cost = area['Land Cost (INR/sq ft)'] * demand * 0.1
+                    labor_cost = area['Labour Cost (INR/day)'] * demand * 0.05
+                    electricity_cost = area['Electricity Cost (INR/unit)'] * demand * 0.02
+                    risk_factor = 1 + (demand / max(cumulative_demands)) * 4
+
+                    G.add_node(area['Industrial Area'], 
+                            land_cost=land_cost,
+                            labor_cost=labor_cost,
+                            electricity_cost=electricity_cost,
+                            risk_factor=risk_factor,
+                            lat=area['Latitude'],
+                            lon=area['Longitude'],
+                            demand=demand)
+
+                # Find optimal locations
+                optimal_locations = find_optimal_locations(G, num_optimal=1)
+
+                # Visualize the network with emphasis on the optimal locations
+                st.write("##### Map of recommended DC relocations for reduced risk")
+                fig, ax = plt.subplots(figsize=(12, 8))
+                
+                # Reuse the Basemap for network visualization
+                m = Basemap(projection='merc', llcrnrlat=8, urcrnrlat=35, llcrnrlon=68, urcrnrlon=97, resolution='i', ax=ax)
+                m.drawcountries(linewidth=1.0, color='black')
+                m.fillcontinents(color='lightgreen', lake_color='aqua')
+                m.drawmapboundary(fill_color='aqua')
+                m.drawstates(linewidth=0.5, color='gray')
+
+                pos = {node: m(G.nodes[node]['lon'], G.nodes[node]['lat']) for node in G.nodes()}
+                nx.draw(G, pos, node_color='lightblue', node_size=500, with_labels=True, ax=ax)
+
+                # Plot optimal locations
+                colors = plt.cm.rainbow(np.linspace(0, 1, len(optimal_locations)))
+                for i, (location, _) in enumerate(optimal_locations):
+                    nx.draw_networkx_nodes(G, pos, nodelist=[location], node_color=[colors[i]], node_size=700, ax=ax)
+                    ax.annotate(f'Optimal {i+1}', pos[location], 
+                                xytext=(5, 5), textcoords='offset points')
+
+                # Plot high-risk DCs with cross marker
+                high_risk_pos = {row['DC Name']: m(row['Longitude'], row['Latitude']) for index, row in df_top_3.iterrows()}
+                nx.draw_networkx_nodes(G, high_risk_pos, nodelist=df_top_3['DC Name'], node_color='red', node_shape='x', node_size=700, ax=ax)
+
+                # Add a legend
+                legend_labels = [
+                    plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='lightblue', markersize=10, label='New Suggested DC'),
+                    plt.Line2D([0], [0], marker='x', color='r', markerfacecolor='red', markersize=10, label='Current High Risk DC')
+                ]
+                ax.legend(handles=legend_labels, loc='upper right')
+
+                ax.set_title("Supply Chain Network - Optimal Locations")
+                st.pyplot(fig)
+
+                # Display details for all recommended nodes
+                st.write("##### Estimated setup costs and risk levels")
+
+                details = []
+                for node in G.nodes():
+                    # Calculate the total cost for the node
+                    total_cost = (G.nodes[node]['land_cost'] + 
+                                G.nodes[node]['labor_cost'] * 30 + 
+                                G.nodes[node]['electricity_cost'] * 1000 + 
+                                G.nodes[node]['risk_factor'] * 1000)
+
+                    # Append the node details to the list
+                    details.append({
+                        "Industrial Area": node,
+                        "Latitude": f"{G.nodes[node]['lat']:.4f}",
+                        "Longitude": f"{G.nodes[node]['lon']:.4f}",
+                        "Total Cost (INR)": f"{total_cost:.2f}",
+                        "Risk Factor": f"{G.nodes[node]['risk_factor']:.2f}"
+                    })
+                
+                # Convert to DataFrame and display as table
+                df_details = pd.DataFrame(details)
+                st.dataframe(df_details)
 
     with tab4:
-        if (st.button("Run Optimizations")):
-            with st.expander("##### Relocation Recommendations"):
-                fig, fig_map, recommended_locations = calculate_recommended_locations()
-                st.pyplot(fig)
-                st.pyplot(fig_map)
-                st.write("##### Recommended DC Locations:")
-                for i, location in enumerate(recommended_locations):
-                    st.write(f"- DC {i+1}: Latitude {location[0]:.4f}, Longitude {location[1]:.4f}")
+        st.markdown("### Optimize: Improve Your Supply Chain")
+        with st.spinner("Optimizing... This may take a moment."):
+            if st.button("Run Optimizations"):
+                with st.expander("Relocation Recommendations", expanded=True):
+                    # Load dataset
+                    @st.cache_data
+                    def load_data():
+                        return pd.read_csv("indian_industrial_areas_dataset_combined.csv")
 
-            with st.expander("##### Optimized Distribution Paths"):
-                aco = SupplyChainACO(n_ants, n_iterations, alpha, beta, rho, q0)
-                aco.initialize(dcs, stores, distances, traffic, risk, emissions, operating_costs, demands, inventories)
-                best_solution, best_cost = aco.run()
-                aco.visualize_solution(best_solution, best_cost)
+                    df = load_data()
 
-                st.write("###### Demand Fulfillment Map")
-                st.pyplot(plot_demand_fulfillment(np.zeros((n_dcs, n_stores))))
-        
+                    fig, fig_map, centroids, cluster_labels, n_clusters = calculate_recommended_locations()
+
+                    # Calculate cumulative demands for each centroid
+                    cumulative_demands = [np.sum(demands[cluster_labels == i]) for i in range(n_clusters)]
+
+                    # Find nearest industrial areas to centroids
+                    nearest_areas = [find_nearest_industrial_area(centroid, df) for centroid in centroids]
+
+                    # Create a supply chain network
+                    G = nx.Graph()
+
+                    # Add nodes (nearest industrial areas) to the graph
+                    for i, area in enumerate(nearest_areas):
+                        demand = cumulative_demands[i]
+                        land_cost = area['Land Cost (INR/sq ft)'] * demand * 0.1
+                        labor_cost = area['Labour Cost (INR/day)'] * demand * 0.05
+                        electricity_cost = area['Electricity Cost (INR/unit)'] * demand * 0.02
+                        risk_factor = 1 + (demand / max(cumulative_demands)) * 4
+
+                        G.add_node(area['Industrial Area'], 
+                                land_cost=land_cost,
+                                labor_cost=labor_cost,
+                                electricity_cost=electricity_cost,
+                                risk_factor=risk_factor,
+                                lat=area['Latitude'],
+                                lon=area['Longitude'],
+                                demand=demand)
+
+                    # Find optimal locations
+                    optimal_locations = find_optimal_locations(G, num_optimal=3)
+
+                    # Visualize the network with emphasis on the optimal locations
+                    st.write("##### Map of recommended DC locations")
+                    fig, ax = plt.subplots(figsize=(12, 8))
+                    
+                    # Reuse the Basemap for network visualization
+                    m = Basemap(projection='merc', llcrnrlat=8, urcrnrlat=35, llcrnrlon=68, urcrnrlon=97, resolution='i', ax=ax)
+                    m.drawcountries(linewidth=1.0, color='black')
+                    m.fillcontinents(color='lightgreen', lake_color='aqua')
+                    m.drawmapboundary(fill_color='aqua')
+                    m.drawstates(linewidth=0.5, color='gray')
+
+                    pos = {node: m(G.nodes[node]['lon'], G.nodes[node]['lat']) for node in G.nodes()}
+                    nx.draw(G, pos, node_color='lightblue', node_size=500, with_labels=True, ax=ax)
+
+                    colors = plt.cm.rainbow(np.linspace(0, 1, len(optimal_locations)))
+                    for i, (location, _) in enumerate(optimal_locations):
+                        nx.draw_networkx_nodes(G, pos, nodelist=[location], node_color=[colors[i]], node_size=700, ax=ax)
+                        ax.annotate(f'Optimal {i+1}', pos[location], 
+                                    xytext=(5, 5), textcoords='offset points')
+
+                    ax.set_title("Supply Chain Network - Optimal Locations")
+                    st.pyplot(fig)
+
+                    # Display details for all recommended nodes
+                    st.write("##### Estimated setup costs")
+
+                    details = []
+                    for node in G.nodes():
+                        # Calculate the total cost for the node
+                        total_cost = (G.nodes[node]['land_cost'] + 
+                                    G.nodes[node]['labor_cost'] * 30 + 
+                                    G.nodes[node]['electricity_cost'] * 1000 + 
+                                    G.nodes[node]['risk_factor'] * 1000)
+
+                        # Append the node details to the list
+                        details.append({
+                            "Industrial Area": node,
+                            "Latitude": f"{G.nodes[node]['lat']:.4f}",
+                            "Longitude": f"{G.nodes[node]['lon']:.4f}",
+                            "Total Cost (INR)": f"{total_cost:.2f}",  # Add total cost to the details
+                            "Land Cost (INR/sq ft)": f"{G.nodes[node]['land_cost']:.2f}",
+                            "Labor Cost (INR/day)": f"{G.nodes[node]['labor_cost']:.2f}",
+                            "Electricity Cost (INR/unit)": f"{G.nodes[node]['electricity_cost']:.2f}",
+                            "Risk Factor": f"{G.nodes[node]['risk_factor']:.2f}",
+                            "Cumulative Demand": f"{G.nodes[node]['demand']:.2f}"
+                        })
+                    
+                    # Convert to DataFrame and display as table
+                    df_details = pd.DataFrame(details)
+                    st.dataframe(df_details)
+
+                with st.expander("Optimized Distribution Paths", expanded=True):
+                    st.markdown("*Computes the most efficient routes to satisfy demand using Ant Colony Optimization.*")
+                    aco = SupplyChainACO(n_ants, n_iterations, alpha, beta, rho, q0)
+                    aco.initialize(dcs, stores, distances, traffic, risk, emissions, operating_costs, demands, inventories)
+                    best_solution, best_cost = aco.run()
+                    aco.visualize_solution(best_solution, best_cost)
+
+    with tab5:
+        st.write("### Forecast: Analyze & Predict Demand Patterns")
+        input_data = generate_seasonal_data(n_periods, n_dcs)
+
+        # Store selector
+        selected_store = st.selectbox("Select a DC for forecasting:", list(input_data.keys()))
+
+        # Run forecast button
+        with st.spinner("Forecasting... This may take a moment."):
+            if st.button("Run Forecast"):
+                # Forecast for all stores in parallel
+                forecasts, avg_forecasts, _ = forecast_all_stores(input_data, forecast_days=10)
+
+                # Expander for chart and forecast table
+                with st.expander("Forecasted Demand", expanded=True):
+                    st.subheader(f"Demand History and Forecast for {selected_store}")
+                    fig, ax = plt.subplots(figsize=(12, 6))
+                    
+                    # Plot historical data
+                    historical_days = pd.date_range(end='2023-08-16', periods=len(input_data[selected_store]), freq='D')
+                    ax.plot(historical_days, input_data[selected_store], label='Historical Demand')
+                    
+                    # Plot forecasted data
+                    forecast_days = pd.date_range(start='2023-08-17', periods=n_forecast_days, freq='D')
+                    ax.plot(forecast_days, forecasts[selected_store], label='Forecasted Demand', color='red')
+                    
+                    ax.set_xlabel('Date')
+                    ax.set_ylabel('Demand')
+                    ax.legend()
+                    ax.set_title(f'Demand History and Forecast for {selected_store}')
+                    plt.xticks(rotation=45)
+                    
+                    st.pyplot(fig)
+
+                    # Display forecasted demands table
+                    st.write(f"###### Forecasted Demand for {selected_store} (Next 10 Days)")
+                    forecast_df = pd.DataFrame({
+                        'Day': range(1, 11),
+                        'Forecasted Demand': forecasts[selected_store]
+                    })
+                    st.table(forecast_df)
+
+                # Expander for top and bottom performing stores
+                with st.expander("DC Rankings", expanded=True):
+                    st.write("#### DC Performance Rankings")
+
+                    # Sort stores based on average forecasted demand
+                    sorted_stores = sorted(avg_forecasts.items(), key=lambda x: x[1], reverse=True)
+                    top_performing = sorted_stores[:3]
+                    bottom_performing = sorted_stores[-3:]
+
+                    # Display top 3 performing stores
+                    st.write("##### Best Performing DCs (Highest Forecasted Demand)")
+                    top_performing_df = pd.DataFrame(top_performing, columns=['Store', 'Avg Forecasted Demand'])
+                    st.table(top_performing_df)
+
+                    # Display bottom 3 performing stores
+                    st.write("##### Bottom 3 Performing DCs (Lowest Forecasted Demand)")
+                    bottom_performing_df = pd.DataFrame(bottom_performing, columns=['Store', 'Avg Forecasted Demand'])
+                    st.table(bottom_performing_df)
+
+    st.markdown("---")
+    st.markdown("*SCAIO Dashboard: Empowering supply chain decisions with AI*")
 
 if __name__ == "__main__":
+
     main()
