@@ -275,17 +275,17 @@ class SupplyChainACO:
 
 def calculate_supply_chain_costs(distances, traffic, risk, emissions, operating_costs, demands, inventories):
   
-    transportation_costs = np.sum(distances * traffic * demands) * 0.0357
+    transportation_costs = np.sum(distances * traffic * demands) * 0.0357 * 83
     
-    risk_costs = np.sum(risk * demands) * 0.44
+    risk_costs = np.sum(risk * demands) * 0.44 * 83
  
-    emission_costs = np.sum(emissions * demands) * 0.36
+    emission_costs = np.sum(emissions * demands) * 0.36 * 83
    
-    total_operating_costs = np.sum(operating_costs) * 12.61
+    total_operating_costs = np.sum(operating_costs) * 12.61 * 83
    
     holding_cost_rate = 0.2
     average_product_value = 50  # Assuming an average product value of $50
-    holding_costs = np.sum(inventories) * average_product_value * holding_cost_rate * 0.42
+    holding_costs = np.sum(inventories) * average_product_value * holding_cost_rate * 0.42 * 83
     
     total_cost = transportation_costs + risk_costs + emission_costs + total_operating_costs + holding_costs
     
@@ -633,7 +633,7 @@ def main():
                 for cost_type, cost_value in supply_chain_costs.items():
                         if cost_type != "Total Supply Chain Cost":
                             percentage = (cost_value / total_cost) * 100
-                            st.write(f"- **{cost_type}:** ${cost_value:,.2f} ({percentage:.2f}%)")
+                            st.write(f"- **{cost_type}:** ₹{cost_value:,.2f} ({percentage:.2f}%)")
 
 
         
@@ -947,7 +947,7 @@ def main():
                     st.table(bottom_performing_df)
 
     st.markdown("---")
-    st.markdown("*SCAIO Dashboard: Empowering supply chain decisions with AI*")
+    st.markdown("*SCAIO: AI-powered supply chain optimization that turns complexity into clarity and risk into opportunity.*")
 
 if __name__ == "__main__":
 
