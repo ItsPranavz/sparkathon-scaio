@@ -1,0 +1,9 @@
+streamlit
+numpy
+matplotlib
+scikit-learn
+networkx
+basemap
+statsmodels
+scipy
+pandas
